@@ -2,7 +2,6 @@
 CaptureMate AI 레포입니다!
 CaptureMate AI는 캡쳐 이미지에서 OCR 텍스트를 추출하고, 추출된 텍스트를 기반으로 캡쳐 카테고리를 분류하는 모델 학습 및 업로드 파이프라인입니다.
 
----
 
 ## 📌 현재 상태
 
@@ -15,7 +14,6 @@ CaptureMate AI는 캡쳐 이미지에서 OCR 텍스트를 추출하고, 추출�
 5. 학습된 best model 저장
 6. Hugging Face Hub 업로드 스크립트 작성
 
----
 
 ## 🧩 분류 카테고리
 
@@ -29,20 +27,19 @@ CaptureMate AI는 캡쳐 이미지에서 OCR 텍스트를 추출하고, 추출�
 | memo | 메모/텍스트 저장용 캡쳐 |
 | unknown | 분류 가치가 낮거나 불필요한 캡쳐 |
 
----
 
 ## 📁 파일 설명
 
 | File | Description |
 |---|---|
-| `ocr.py` | 이미지에서 OCR 텍스트를 추출하고 정제하여 CSV 생성 |
-| `prepare_dataset_for_train.py` | 전체 CSV 데이터를 train / validation / test로 분리 |
-| `test_train.py` | KLUE-RoBERTa 기반 분류 모델 학습 및 평가 |
-| `download_model.py` | 사전학습 모델 다운로드용 스크립트 |
-| `upload_to_huggingface.py` | 학습 완료된 모델을 Hugging Face Hub에 업로드 |
+| `run_pipeline.py` | 전체 AI 파이프라인을 순서대로 실행하는 메인 스크립트 |
+| `download_base_model.py` | Hugging Face에서 KLUE-RoBERTa 사전학습 모델을 다운로드 |
+| `extract_ocr_dataset.py` | PaddleOCR로 이미지 텍스트를 추출하고 정제하여 CSV 데이터셋 생성 |
+| `split_dataset.py` | 전체 CSV 데이터를 train / validation / test로 분리 |
+| `train_classifier.py` | KLUE-RoBERTa 기반 카테고리 분류 모델 학습 및 평가 |
+| `upload_model_to_hub.py` | 학습 완료된 best model을 Hugging Face Hub에 업로드 |
 | `requirements.txt` | 실행에 필요한 Python 패키지 목록 |
 
----
 
 ## 🚫 Git에 포함하지 않는 파일
 
@@ -57,37 +54,31 @@ CaptureMate AI는 캡쳐 이미지에서 OCR 텍스트를 추출하고, 추출�
 | `outputs/**/*.safetensors` | 모델 weight 파일 |
 | `paddle_ocr_env/` | Python 가상환경 |
 
----
 
 ## 🔄 전체 파이프라인
 
 ```txt
 캡쳐 이미지 수집
 ↓
-ocr.py 실행
+run_pipeline.py 실행
+↓
+사전학습 모델 다운로드
 ↓
 OCR 텍스트 추출 및 정제
 ↓
 full_dataset.csv 생성
 ↓
-prepare_dataset_for_train.py 실행
-↓
 train / validation / test 데이터 분리
-↓
-test_train.py 실행
 ↓
 분류 모델 학습 및 평가
 ↓
-outputs/best_classifier 저장
+best classifier 저장
 ↓
-upload_to_huggingface.py 실행
-↓
-Hugging Face Hub에 모델 업로드
+Hugging Face Hub 업로드
 ↓
 백엔드에서 모델 로드 후 OCR 텍스트 분류
 ```
 
----
 
 ## 🧪 학습 결과 예시
 
@@ -100,7 +91,6 @@ Hugging Face Hub에 모델 업로드
 | Macro Precision | 86.19% | 93.24% |
 | Macro Recall | 85.20% | 92.87% |
 
----
 
 ## 🤗 Hugging Face Model
 
@@ -115,7 +105,6 @@ tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
 model = AutoModelForSequenceClassification.from_pretrained(MODEL_NAME)
 ```
 
----
 
 ## 🚀 모델 사용 방식
 
@@ -141,28 +130,10 @@ DB 저장 및 앱에 전달
 pip install -r requirements.txt
 ```
 
-### 2. OCR 데이터셋 생성
+### 2. 전체 파이프라인 실행
 
 ```bash
-python ocr.py
-```
-
-### 3. 데이터셋 분리
-
-```bash
-python prepare_dataset_for_train.py
-```
-
-### 4. 모델 학습
-
-```bash
-python test_train.py
-```
-
-### 5. Hugging Face 업로드
-
-```bash
-python upload_to_huggingface.py
+python run_pipeline.py
 ```
 
 ---

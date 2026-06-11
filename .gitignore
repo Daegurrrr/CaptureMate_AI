@@ -1,6 +1,27 @@
-.DS_Store
+# Python
 __pycache__/
+*.py[cod]
+
+# Virtual env
+paddle_ocr_env/
 venv/
-outputs/
+.venv/
+
+# Dataset
+data/
 images/
-.Rhistory
+
+# Training outputs
+outputs/checkpoints/
+outputs/**/*.bin
+outputs/**/*.safetensors
+
+# Local pretrained models
+models/
+
+# Mac
+.DS_Store
+
+# IDE
+.vscode/
+.idea/

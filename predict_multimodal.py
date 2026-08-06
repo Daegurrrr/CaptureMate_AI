@@ -1,13 +1,22 @@
 from pathlib import Path
 
+import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from PIL import Image
+from sklearn.metrics import (
+    accuracy_score,
+    classification_report,
+    confusion_matrix,
+    f1_score,
+    precision_score,
+    recall_score,
+)
 from transformers import (
-    AutoTokenizer,
     AutoModelForSequenceClassification,
+    AutoTokenizer,
     CLIPImageProcessor,
     CLIPVisionModelWithProjection,
 )
@@ -25,6 +34,8 @@ IMAGE_MODEL_DIR = "./outputs/best_image_classifier"
 IMAGE_CHECKPOINT_PATH = (
     "./outputs/best_image_classifier/image_classifier.pt"
 )
+
+TEST_CSV_PATH = "./data/test.csv"
 
 TEXT_WEIGHT = 0.7
 IMAGE_WEIGHT = 0.3
@@ -209,9 +220,9 @@ def predict_text(
     tokenizer,
     model,
 ):
-    clean_text = text.strip()
+    clean_text = str(text).strip()
 
-    if not clean_text:
+    if not clean_text or clean_text.lower() == "nan":
         clean_text = "[EMPTY]"
 
     inputs = tokenizer(
@@ -235,13 +246,11 @@ def predict_text(
         dim=-1,
     )[0]
 
-    scores = {
+    return {
         ID2LABEL[index]: probability.item()
         for index, probability
         in enumerate(probabilities)
     }
-
-    return scores
 
 
 # ==========================================
@@ -282,13 +291,11 @@ def predict_image(
         dim=-1,
     )[0]
 
-    scores = {
+    return {
         ID2LABEL[index]: probability.item()
         for index, probability
         in enumerate(probabilities)
     }
-
-    return scores
 
 
 # ==========================================
@@ -352,7 +359,7 @@ def print_scores(
 
 
 # ==========================================
-# 전체 예측
+# 이미지 한 장 전체 예측
 # ==========================================
 
 def predict_multimodal(
@@ -414,6 +421,317 @@ def predict_multimodal(
 
 
 # ==========================================
+# test.csv 전체 평가
+# ==========================================
+
+def evaluate_multimodal(
+    tokenizer,
+    text_model,
+    image_processor,
+    image_model,
+    test_csv: str = TEST_CSV_PATH,
+):
+    test_path = Path(test_csv)
+
+    if not test_path.exists():
+        raise FileNotFoundError(
+            f"테스트 CSV가 없습니다: {test_path}"
+        )
+
+    test_df = pd.read_csv(
+        test_path,
+        encoding="utf-8-sig",
+    )
+
+    required_columns = {
+        "image_path",
+        "text",
+        "label",
+    }
+
+    missing_columns = (
+        required_columns - set(test_df.columns)
+    )
+
+    if missing_columns:
+        raise ValueError(
+            f"테스트 CSV에 필요한 컬럼이 없습니다: "
+            f"{sorted(missing_columns)}"
+        )
+
+    targets = []
+    predictions = []
+
+    text_predictions = []
+    image_predictions = []
+
+    failed_count = 0
+    total_count = len(test_df)
+
+    print("\n" + "=" * 60)
+    print(f"멀티모달 전체 평가 시작: {total_count}개")
+    print(
+        f"Fusion 비율: "
+        f"Text {TEXT_WEIGHT} / Image {IMAGE_WEIGHT}"
+    )
+    print("=" * 60)
+
+    for position, (_, row) in enumerate(
+        test_df.iterrows(),
+        start=1,
+    ):
+        image_path = str(
+            row["image_path"]
+        ).strip()
+
+        ocr_text = str(
+            row["text"]
+        ).strip()
+
+        target_label = str(
+            row["label"]
+        ).strip()
+
+        if target_label not in LABEL2ID:
+            print(
+                f"[{position}/{total_count}] "
+                f"지원하지 않는 라벨: {target_label}"
+            )
+            failed_count += 1
+            continue
+
+        try:
+            text_scores = predict_text(
+                text=ocr_text,
+                tokenizer=tokenizer,
+                model=text_model,
+            )
+
+            image_scores = predict_image(
+                image_path=image_path,
+                image_processor=image_processor,
+                model=image_model,
+            )
+
+            (
+                predicted_label,
+                _,
+                _,
+            ) = fuse_predictions(
+                text_scores=text_scores,
+                image_scores=image_scores,
+            )
+
+            text_label = max(
+                text_scores,
+                key=text_scores.get,
+            )
+
+            image_label = max(
+                image_scores,
+                key=image_scores.get,
+            )
+
+            targets.append(target_label)
+            predictions.append(predicted_label)
+
+            text_predictions.append(
+                text_label
+            )
+
+            image_predictions.append(
+                image_label
+            )
+
+            mark = (
+                "O"
+                if target_label == predicted_label
+                else "X"
+            )
+
+            print(
+                f"[{position}/{total_count}] "
+                f"{mark} "
+                f"정답={target_label}, "
+                f"Text={text_label}, "
+                f"Image={image_label}, "
+                f"Fusion={predicted_label}"
+            )
+
+        except Exception as error:
+            failed_count += 1
+
+            print(
+                f"[{position}/{total_count}] "
+                f"처리 실패: {image_path}"
+            )
+            print(f"오류: {error}")
+
+    if not predictions:
+        print("\n평가 가능한 데이터가 없습니다.")
+        return
+
+    label_names = list(
+        LABEL2ID.keys()
+    )
+
+    fusion_accuracy = accuracy_score(
+        targets,
+        predictions,
+    )
+
+    fusion_macro_f1 = f1_score(
+        targets,
+        predictions,
+        average="macro",
+        zero_division=0,
+    )
+
+    fusion_precision = precision_score(
+        targets,
+        predictions,
+        average="macro",
+        zero_division=0,
+    )
+
+    fusion_recall = recall_score(
+        targets,
+        predictions,
+        average="macro",
+        zero_division=0,
+    )
+
+    text_accuracy = accuracy_score(
+        targets,
+        text_predictions,
+    )
+
+    text_macro_f1 = f1_score(
+        targets,
+        text_predictions,
+        average="macro",
+        zero_division=0,
+    )
+
+    image_accuracy = accuracy_score(
+        targets,
+        image_predictions,
+    )
+
+    image_macro_f1 = f1_score(
+        targets,
+        image_predictions,
+        average="macro",
+        zero_division=0,
+    )
+
+    print("\n" + "=" * 60)
+    print("모델별 성능 비교")
+    print("=" * 60)
+
+    print("\n[RoBERTa Text]")
+    print(f"Accuracy : {text_accuracy:.4f}")
+    print(f"Macro F1 : {text_macro_f1:.4f}")
+
+    print("\n[CLIP Image]")
+    print(f"Accuracy : {image_accuracy:.4f}")
+    print(f"Macro F1 : {image_macro_f1:.4f}")
+
+    print("\n[Multimodal Fusion]")
+    print(f"Accuracy        : {fusion_accuracy:.4f}")
+    print(f"Macro F1        : {fusion_macro_f1:.4f}")
+    print(f"Macro Precision : {fusion_precision:.4f}")
+    print(f"Macro Recall    : {fusion_recall:.4f}")
+
+    print("\n[Multimodal Classification Report]")
+
+    print(
+        classification_report(
+            targets,
+            predictions,
+            labels=label_names,
+            target_names=label_names,
+            digits=4,
+            zero_division=0,
+        )
+    )
+
+    print("[Multimodal Confusion Matrix]")
+
+    print(
+        confusion_matrix(
+            targets,
+            predictions,
+            labels=label_names,
+        )
+    )
+
+    print(
+        f"\n평가 성공: {len(predictions)}개"
+    )
+    print(
+        f"평가 실패: {failed_count}개"
+    )
+
+
+# ==========================================
+# 이미지 한 장 테스트 출력
+# ==========================================
+
+def run_single_test(
+    tokenizer,
+    text_model,
+    image_processor,
+    image_model,
+):
+    image_path = input(
+        "\n이미지 경로: "
+    ).strip()
+
+    if not Path(image_path).exists():
+        print("이미지 파일이 존재하지 않습니다.")
+        return
+
+    try:
+        result = predict_multimodal(
+            image_path=image_path,
+            tokenizer=tokenizer,
+            text_model=text_model,
+            image_processor=image_processor,
+            image_model=image_model,
+        )
+
+        print_scores(
+            "RoBERTa 텍스트 확률",
+            result["text_scores"],
+        )
+
+        print_scores(
+            "CLIP 이미지 확률",
+            result["image_scores"],
+        )
+
+        print_scores(
+            "최종 결합 확률",
+            result["final_scores"],
+        )
+
+        print("\n" + "=" * 50)
+        print(
+            f"최종 카테고리 : "
+            f"{result['category']}"
+        )
+        print(
+            f"최종 신뢰도   : "
+            f"{result['confidence']:.4f}"
+        )
+        print("=" * 50)
+
+    except Exception as error:
+        print(f"\n오류 발생: {error}")
+
+
+# ==========================================
 # 실행
 # ==========================================
 
@@ -421,56 +739,61 @@ def main():
     print(f"사용 장치: {DEVICE}")
 
     print("텍스트 모델 로드 중...")
-    tokenizer, text_model = load_text_model()
+    tokenizer, text_model = (
+        load_text_model()
+    )
 
     print("이미지 모델 로드 중...")
-    image_processor, image_model = load_image_model()
+    image_processor, image_model = (
+        load_image_model()
+    )
 
     while True:
-        image_path = input(
-            "\n이미지 경로 (종료: q): "
-        ).strip()
+        print("\n" + "=" * 50)
+        print("1. 이미지 한 장 테스트")
+        print("2. test.csv 전체 성능 평가")
+        print("q. 종료")
+        print("=" * 50)
 
-        if image_path.lower() in {"q", "quit", "exit"}:
+        menu = input(
+            "선택: "
+        ).strip().lower()
+
+        if menu in {
+            "q",
+            "quit",
+            "exit",
+        }:
             print("프로그램을 종료합니다.")
             break
 
-        if not Path(image_path).exists():
-            print("이미지 파일이 존재하지 않습니다.")
-            continue
-
-        try:
-            result = predict_multimodal(
-                image_path=image_path,
+        if menu == "1":
+            run_single_test(
                 tokenizer=tokenizer,
                 text_model=text_model,
                 image_processor=image_processor,
                 image_model=image_model,
             )
 
-            print_scores(
-                "RoBERTa 텍스트 확률",
-                result["text_scores"],
+        elif menu == "2":
+            try:
+                evaluate_multimodal(
+                    tokenizer=tokenizer,
+                    text_model=text_model,
+                    image_processor=image_processor,
+                    image_model=image_model,
+                )
+
+            except Exception as error:
+                print(
+                    f"\n평가 중 오류 발생: {error}"
+                )
+
+        else:
+            print(
+                "1, 2 또는 q를 입력해주세요."
             )
 
-            print_scores(
-                "CLIP 이미지 확률",
-                result["image_scores"],
-            )
 
-            print_scores(
-                "최종 결합 확률",
-                result["final_scores"],
-            )
-
-            print("\n" + "=" * 50)
-            print(f"최종 카테고리 : {result['category']}")
-            print(f"최종 신뢰도   : {result['confidence']:.4f}")
-            print("=" * 50)
-
-        except Exception as e:
-            print(f"\n오류 발생: {e}")
-            
-            
 if __name__ == "__main__":
     main()

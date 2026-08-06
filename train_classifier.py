@@ -34,7 +34,8 @@ LABEL2ID = {
     "shopping": 1,
     "place": 2,
     "memo": 3,
-    "trash": 4,
+    # "trash": 4,
+    "unknown": 4,
 }
 ID2LABEL = {v: k for k, v in LABEL2ID.items()}
 

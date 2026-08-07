@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 
 import pandas as pd
@@ -20,25 +21,50 @@ from transformers import (
     CLIPImageProcessor,
     CLIPVisionModelWithProjection,
 )
-
-from extract_ocr_dataset import extract_text
+from huggingface_hub import snapshot_download
 
 
 # ==========================================
 # 설정
 # ==========================================
 
-TEXT_MODEL_DIR = "./outputs/best_classifier"
+TEXT_MODEL_ID = os.getenv(
+    "CAPTUREMATE_TEXT_MODEL_ID",
+    "hur03/capturemate-category-classifier-v1-5class",
+)
 
-IMAGE_MODEL_DIR = "./outputs/best_image_classifier"
-IMAGE_CHECKPOINT_PATH = (
-    "./outputs/best_image_classifier/image_classifier.pt"
+IMAGE_MODEL_DIR = os.getenv(
+    "CAPTUREMATE_IMAGE_MODEL_DIR",
+    "",
+)
+
+IMAGE_MODEL_ID = os.getenv(
+    "CAPTUREMATE_IMAGE_MODEL_ID",
+    "hur03/capturemate-image-classifier-v1-5class",
+)
+
+IMAGE_MODEL_CACHE_DIR = os.getenv(
+    "CAPTUREMATE_IMAGE_MODEL_CACHE_DIR",
+    "",
 )
 
 TEST_CSV_PATH = "./data/test.csv"
 
 TEXT_WEIGHT = 0.7
 IMAGE_WEIGHT = 0.3
+FUSION_WEIGHT_GRID = [
+    0.0,
+    0.1,
+    0.2,
+    0.3,
+    0.4,
+    0.5,
+    0.6,
+    0.7,
+    0.8,
+    0.9,
+    1.0,
+]
 
 MAX_LENGTH = 256
 NUM_LABELS = 5
@@ -67,7 +93,7 @@ DEVICE = (
 
 # ==========================================
 # CLIP 이미지 분류 모델
-# image_classifier.py와 구조가 같아야 함
+# Hugging Face에 저장된 커스텀 체크포인트 구조와 같아야 함
 # ==========================================
 
 class CLIPUIClassifier(nn.Module):
@@ -137,20 +163,15 @@ class CLIPUIClassifier(nn.Module):
 # ==========================================
 
 def load_text_model():
-    model_path = Path(TEXT_MODEL_DIR)
-
-    if not model_path.exists():
-        raise FileNotFoundError(
-            f"텍스트 모델 폴더가 없습니다: {model_path}"
-        )
+    print(f"텍스트 모델: {TEXT_MODEL_ID}")
 
     tokenizer = AutoTokenizer.from_pretrained(
-        TEXT_MODEL_DIR
+        TEXT_MODEL_ID
     )
 
     model = (
         AutoModelForSequenceClassification
-        .from_pretrained(TEXT_MODEL_DIR)
+        .from_pretrained(TEXT_MODEL_ID)
         .to(DEVICE)
     )
 
@@ -164,8 +185,31 @@ def load_text_model():
 # ==========================================
 
 def load_image_model():
-    checkpoint_path = Path(
-        IMAGE_CHECKPOINT_PATH
+    if IMAGE_MODEL_DIR:
+        image_model_dir = Path(
+            IMAGE_MODEL_DIR
+        )
+        print(f"이미지 모델 로컬 경로: {image_model_dir}")
+    else:
+        print(f"이미지 모델: {IMAGE_MODEL_ID}")
+        image_model_dir = Path(
+            snapshot_download(
+                repo_id=IMAGE_MODEL_ID,
+                repo_type="model",
+                cache_dir=(
+                    IMAGE_MODEL_CACHE_DIR
+                    or None
+                ),
+                allow_patterns=[
+                    "image_classifier.pt",
+                    "preprocessor_config.json",
+                ],
+            )
+        )
+
+    checkpoint_path = (
+        image_model_dir
+        / "image_classifier.pt"
     )
 
     if not checkpoint_path.exists():
@@ -191,7 +235,7 @@ def load_image_model():
 
     image_processor = (
         CLIPImageProcessor.from_pretrained(
-            IMAGE_MODEL_DIR
+            image_model_dir
         )
     )
 
@@ -302,6 +346,25 @@ def predict_image(
 # 결과 결합
 # ==========================================
 
+def get_top_score(scores):
+    sorted_scores = sorted(
+        scores.items(),
+        key=lambda item: item[1],
+        reverse=True,
+    )
+
+    top_label, top_score = sorted_scores[0]
+    second_label, second_score = sorted_scores[1]
+
+    return {
+        "label": top_label,
+        "confidence": top_score,
+        "second_label": second_label,
+        "second_confidence": second_score,
+        "margin": top_score - second_score,
+    }
+
+
 def fuse_predictions(
     text_scores,
     image_scores,
@@ -334,6 +397,139 @@ def fuse_predictions(
     ]
 
     return predicted_label, confidence, final_scores
+
+
+def choose_adaptive_weights(
+    text_scores,
+    image_scores,
+):
+    text_top = get_top_score(
+        text_scores
+    )
+
+    image_top = get_top_score(
+        image_scores
+    )
+
+    text_confidence = text_top[
+        "confidence"
+    ]
+
+    text_margin = text_top[
+        "margin"
+    ]
+
+    image_confidence = image_top[
+        "confidence"
+    ]
+
+    image_margin = image_top[
+        "margin"
+    ]
+
+    # 텍스트 모델이 확실할수록 텍스트 비중을 높이고,
+    # 텍스트가 애매하면 이미지 모델이 더 개입하게 한다.
+    if (
+        text_confidence >= 0.85
+        and text_margin >= 0.50
+    ):
+        text_weight = 0.80
+    elif (
+        text_confidence >= 0.70
+        and text_margin >= 0.30
+    ):
+        text_weight = 0.65
+    elif text_confidence >= 0.55:
+        text_weight = 0.50
+    else:
+        text_weight = 0.35
+
+    # 이미지 모델이 매우 확신하고 텍스트 모델은 덜 확실하면
+    # 이미지 비중을 조금 더 키운다.
+    if (
+        image_confidence >= 0.85
+        and image_margin >= 0.50
+        and text_confidence < 0.80
+    ):
+        text_weight -= 0.15
+
+    # 두 모델이 같은 라벨을 고르면 결합 결과는 안정적이므로,
+    # 과하게 한쪽으로 쏠리지 않게 중간값으로 둔다.
+    if text_top["label"] == image_top["label"]:
+        text_weight = max(
+            0.45,
+            min(text_weight, 0.70),
+        )
+
+    text_weight = max(
+        0.20,
+        min(text_weight, 0.85),
+    )
+
+    image_weight = 1.0 - text_weight
+
+    return text_weight, image_weight
+
+
+def fuse_predictions_adaptive(
+    text_scores,
+    image_scores,
+):
+    text_weight, image_weight = (
+        choose_adaptive_weights(
+            text_scores=text_scores,
+            image_scores=image_scores,
+        )
+    )
+
+    (
+        predicted_label,
+        confidence,
+        final_scores,
+    ) = fuse_predictions(
+        text_scores=text_scores,
+        image_scores=image_scores,
+        text_weight=text_weight,
+        image_weight=image_weight,
+    )
+
+    return (
+        predicted_label,
+        confidence,
+        final_scores,
+        text_weight,
+        image_weight,
+    )
+
+
+def calculate_metrics(
+    targets,
+    predictions,
+):
+    return {
+        "accuracy": accuracy_score(
+            targets,
+            predictions,
+        ),
+        "macro_f1": f1_score(
+            targets,
+            predictions,
+            average="macro",
+            zero_division=0,
+        ),
+        "macro_precision": precision_score(
+            targets,
+            predictions,
+            average="macro",
+            zero_division=0,
+        ),
+        "macro_recall": recall_score(
+            targets,
+            predictions,
+            average="macro",
+            zero_division=0,
+        ),
+    }
 
 
 # ==========================================
@@ -371,6 +567,8 @@ def predict_multimodal(
 ):
     print("\n1) OCR 텍스트 추출")
 
+    from extract_ocr_dataset import extract_text
+
     ocr_text = extract_text(
         image_path
     )
@@ -407,6 +605,8 @@ def predict_multimodal(
     ) = fuse_predictions(
         text_scores=text_scores,
         image_scores=image_scores,
+        text_weight=TEXT_WEIGHT,
+        image_weight=IMAGE_WEIGHT,
     )
 
     return {
@@ -417,6 +617,8 @@ def predict_multimodal(
         "final_scores": final_scores,
         "category": final_label,
         "confidence": final_confidence,
+        "text_weight": TEXT_WEIGHT,
+        "image_weight": IMAGE_WEIGHT,
     }
 
 
@@ -460,10 +662,13 @@ def evaluate_multimodal(
         )
 
     targets = []
-    predictions = []
-
     text_predictions = []
     image_predictions = []
+    default_fusion_predictions = []
+    fixed_predictions_by_weight = {
+        text_weight: []
+        for text_weight in FUSION_WEIGHT_GRID
+    }
 
     failed_count = 0
     total_count = len(test_df)
@@ -471,9 +676,10 @@ def evaluate_multimodal(
     print("\n" + "=" * 60)
     print(f"멀티모달 전체 평가 시작: {total_count}개")
     print(
-        f"Fusion 비율: "
+        f"기본 고정 Fusion 비율: "
         f"Text {TEXT_WEIGHT} / Image {IMAGE_WEIGHT}"
     )
+    print("기본 고정 Fusion을 최종값으로 사용하고, 가중치 스윕은 참고용으로 평가합니다.")
     print("=" * 60)
 
     for position, (_, row) in enumerate(
@@ -514,12 +720,14 @@ def evaluate_multimodal(
             )
 
             (
-                predicted_label,
+                default_fusion_label,
                 _,
                 _,
             ) = fuse_predictions(
                 text_scores=text_scores,
                 image_scores=image_scores,
+                text_weight=TEXT_WEIGHT,
+                image_weight=IMAGE_WEIGHT,
             )
 
             text_label = max(
@@ -533,7 +741,6 @@ def evaluate_multimodal(
             )
 
             targets.append(target_label)
-            predictions.append(predicted_label)
 
             text_predictions.append(
                 text_label
@@ -543,9 +750,31 @@ def evaluate_multimodal(
                 image_label
             )
 
+            default_fusion_predictions.append(
+                default_fusion_label
+            )
+
+            for text_weight in FUSION_WEIGHT_GRID:
+                image_weight = 1.0 - text_weight
+
+                (
+                    fixed_label,
+                    _,
+                    _,
+                ) = fuse_predictions(
+                    text_scores=text_scores,
+                    image_scores=image_scores,
+                    text_weight=text_weight,
+                    image_weight=image_weight,
+                )
+
+                fixed_predictions_by_weight[
+                    text_weight
+                ].append(fixed_label)
+
             mark = (
                 "O"
-                if target_label == predicted_label
+                if target_label == default_fusion_label
                 else "X"
             )
 
@@ -555,7 +784,8 @@ def evaluate_multimodal(
                 f"정답={target_label}, "
                 f"Text={text_label}, "
                 f"Image={image_label}, "
-                f"Fusion={predicted_label}"
+                f"Fusion={default_fusion_label}, "
+                f"W=({TEXT_WEIGHT:.2f}/{IMAGE_WEIGHT:.2f})"
             )
 
         except Exception as error:
@@ -567,7 +797,7 @@ def evaluate_multimodal(
             )
             print(f"오류: {error}")
 
-    if not predictions:
+    if not default_fusion_predictions:
         print("\n평가 가능한 데이터가 없습니다.")
         return
 
@@ -575,54 +805,47 @@ def evaluate_multimodal(
         LABEL2ID.keys()
     )
 
-    fusion_accuracy = accuracy_score(
+    default_fusion_metrics = calculate_metrics(
         targets,
-        predictions,
+        default_fusion_predictions,
     )
 
-    fusion_macro_f1 = f1_score(
-        targets,
-        predictions,
-        average="macro",
-        zero_division=0,
-    )
-
-    fusion_precision = precision_score(
-        targets,
-        predictions,
-        average="macro",
-        zero_division=0,
-    )
-
-    fusion_recall = recall_score(
-        targets,
-        predictions,
-        average="macro",
-        zero_division=0,
-    )
-
-    text_accuracy = accuracy_score(
+    text_metrics = calculate_metrics(
         targets,
         text_predictions,
     )
 
-    text_macro_f1 = f1_score(
-        targets,
-        text_predictions,
-        average="macro",
-        zero_division=0,
-    )
-
-    image_accuracy = accuracy_score(
+    image_metrics = calculate_metrics(
         targets,
         image_predictions,
     )
 
-    image_macro_f1 = f1_score(
-        targets,
-        image_predictions,
-        average="macro",
-        zero_division=0,
+    fixed_results = []
+
+    for text_weight, weight_predictions in (
+        fixed_predictions_by_weight.items()
+    ):
+        metrics = calculate_metrics(
+            targets,
+            weight_predictions,
+        )
+
+        fixed_results.append(
+            {
+                "text_weight": text_weight,
+                "image_weight": 1.0 - text_weight,
+                "predictions": weight_predictions,
+                **metrics,
+            }
+        )
+
+    fixed_results = sorted(
+        fixed_results,
+        key=lambda item: (
+            item["macro_f1"],
+            item["accuracy"],
+        ),
+        reverse=True,
     )
 
     print("\n" + "=" * 60)
@@ -630,25 +853,83 @@ def evaluate_multimodal(
     print("=" * 60)
 
     print("\n[RoBERTa Text]")
-    print(f"Accuracy : {text_accuracy:.4f}")
-    print(f"Macro F1 : {text_macro_f1:.4f}")
+    print(
+        f"Accuracy : {text_metrics['accuracy']:.4f}"
+    )
+    print(
+        f"Macro F1 : {text_metrics['macro_f1']:.4f}"
+    )
 
     print("\n[CLIP Image]")
-    print(f"Accuracy : {image_accuracy:.4f}")
-    print(f"Macro F1 : {image_macro_f1:.4f}")
+    print(
+        f"Accuracy : {image_metrics['accuracy']:.4f}"
+    )
+    print(
+        f"Macro F1 : {image_metrics['macro_f1']:.4f}"
+    )
 
-    print("\n[Multimodal Fusion]")
-    print(f"Accuracy        : {fusion_accuracy:.4f}")
-    print(f"Macro F1        : {fusion_macro_f1:.4f}")
-    print(f"Macro Precision : {fusion_precision:.4f}")
-    print(f"Macro Recall    : {fusion_recall:.4f}")
+    print("\n[Fixed Weight Sweep]")
+    print("Text/Image | Accuracy | Macro F1")
 
-    print("\n[Multimodal Classification Report]")
+    for result in fixed_results:
+        print(
+            f"{result['text_weight']:.1f}/"
+            f"{result['image_weight']:.1f}"
+            f"     | {result['accuracy']:.4f}"
+            f"   | {result['macro_f1']:.4f}"
+        )
+
+    best_fixed = fixed_results[0]
+
+    print("\n[Default Fixed Fusion]")
+    print(
+        f"Weight          : Text {TEXT_WEIGHT:.1f} / "
+        f"Image {IMAGE_WEIGHT:.1f}"
+    )
+    print(
+        f"Accuracy        : "
+        f"{default_fusion_metrics['accuracy']:.4f}"
+    )
+    print(
+        f"Macro F1        : "
+        f"{default_fusion_metrics['macro_f1']:.4f}"
+    )
+    print(
+        f"Macro Precision : "
+        f"{default_fusion_metrics['macro_precision']:.4f}"
+    )
+    print(
+        f"Macro Recall    : "
+        f"{default_fusion_metrics['macro_recall']:.4f}"
+    )
+
+    print("\n[Best Fixed Fusion in Sweep]")
+    print(
+        f"Weight          : Text "
+        f"{best_fixed['text_weight']:.1f} / Image "
+        f"{best_fixed['image_weight']:.1f}"
+    )
+    print(
+        f"Accuracy        : {best_fixed['accuracy']:.4f}"
+    )
+    print(
+        f"Macro F1        : {best_fixed['macro_f1']:.4f}"
+    )
+    print(
+        f"Macro Precision : "
+        f"{best_fixed['macro_precision']:.4f}"
+    )
+    print(
+        f"Macro Recall    : "
+        f"{best_fixed['macro_recall']:.4f}"
+    )
+
+    print("\n[Default Fixed Fusion Classification Report]")
 
     print(
         classification_report(
             targets,
-            predictions,
+            default_fusion_predictions,
             labels=label_names,
             target_names=label_names,
             digits=4,
@@ -656,18 +937,18 @@ def evaluate_multimodal(
         )
     )
 
-    print("[Multimodal Confusion Matrix]")
+    print("[Default Fixed Fusion Confusion Matrix]")
 
     print(
         confusion_matrix(
             targets,
-            predictions,
+            default_fusion_predictions,
             labels=label_names,
         )
     )
 
     print(
-        f"\n평가 성공: {len(predictions)}개"
+        f"\n평가 성공: {len(default_fusion_predictions)}개"
     )
     print(
         f"평가 실패: {failed_count}개"
@@ -724,6 +1005,11 @@ def run_single_test(
         print(
             f"최종 신뢰도   : "
             f"{result['confidence']:.4f}"
+        )
+        print(
+            f"적용 가중치   : "
+            f"Text {result['text_weight']:.2f} / "
+            f"Image {result['image_weight']:.2f}"
         )
         print("=" * 50)
 

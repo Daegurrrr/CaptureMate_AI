@@ -14,7 +14,8 @@ LABEL2ID = {
     "shopping": 1,
     "place": 2,
     "memo": 3,
-    "trash": 4,
+    #"trash": 4,
+    "unknown": 4, # 기타 포함
 }
 
 RANDOM_STATE = 42

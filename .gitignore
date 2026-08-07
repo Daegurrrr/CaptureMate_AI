@@ -12,9 +12,10 @@ data/
 images/
 
 # Training outputs
-outputs/checkpoints/
-outputs/**/*.bin
-outputs/**/*.safetensors
+outputs/
+# outputs/checkpoints/
+# outputs/**/*.bin
+# outputs/**/*.safetensors
 
 # Local pretrained models
 models/

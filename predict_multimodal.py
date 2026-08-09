@@ -1,5 +1,10 @@
+import argparse
+import contextlib
+import csv
+import json
 import os
 from pathlib import Path
+import sys
 
 import pandas as pd
 import torch
@@ -50,8 +55,8 @@ IMAGE_MODEL_CACHE_DIR = os.getenv(
 
 TEST_CSV_PATH = "./data/test.csv"
 
-TEXT_WEIGHT = 0.7
-IMAGE_WEIGHT = 0.3
+TEXT_WEIGHT = 0.75
+IMAGE_WEIGHT = 0.25
 FUSION_WEIGHT_GRID = [
     0.0,
     0.1,
@@ -61,10 +66,19 @@ FUSION_WEIGHT_GRID = [
     0.5,
     0.6,
     0.7,
+    0.75,
     0.8,
     0.9,
     1.0,
 ]
+
+VALID_IMAGE_EXTENSIONS = {
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".bmp",
+    ".webp",
+}
 
 MAX_LENGTH = 256
 NUM_LABELS = 5
@@ -554,6 +568,273 @@ def print_scores(
         )
 
 
+def shorten_text(text: str, max_length: int = 80) -> str:
+    text = " ".join(str(text).split())
+
+    if len(text) <= max_length:
+        return text
+
+    return text[: max_length - 3] + "..."
+
+
+def find_image_paths(path: str):
+    target = Path(path)
+
+    if not target.exists():
+        raise FileNotFoundError(
+            f"이미지 경로가 없습니다: {target}"
+        )
+
+    if target.is_file():
+        if target.suffix.lower() not in VALID_IMAGE_EXTENSIONS:
+            raise ValueError(
+                f"지원하지 않는 이미지 확장자입니다: {target}"
+            )
+
+        return [target]
+
+    return sorted(
+        child
+        for child in target.rglob("*")
+        if child.is_file()
+        and child.suffix.lower() in VALID_IMAGE_EXTENSIONS
+    )
+
+
+def predict_single_image_result(
+    image_path: Path,
+    tokenizer,
+    text_model,
+    image_processor,
+    image_model,
+):
+    from extract_ocr_dataset import extract_text
+
+    ocr_text = extract_text(
+        str(image_path)
+    )
+
+    text_scores = predict_text(
+        text=ocr_text,
+        tokenizer=tokenizer,
+        model=text_model,
+    )
+
+    image_scores = predict_image(
+        image_path=str(image_path),
+        image_processor=image_processor,
+        model=image_model,
+    )
+
+    (
+        final_label,
+        final_confidence,
+        final_scores,
+    ) = fuse_predictions(
+        text_scores=text_scores,
+        image_scores=image_scores,
+        text_weight=TEXT_WEIGHT,
+        image_weight=IMAGE_WEIGHT,
+    )
+
+    text_top = get_top_score(
+        text_scores
+    )
+    image_top = get_top_score(
+        image_scores
+    )
+
+    return {
+        "filename": image_path.name,
+        "image_path": str(image_path),
+        "ocr_text": ocr_text,
+        "text_label": text_top["label"],
+        "text_confidence": text_top["confidence"],
+        "image_label": image_top["label"],
+        "image_confidence": image_top["confidence"],
+        "final_label": final_label,
+        "final_confidence": final_confidence,
+        "final_scores": final_scores,
+        "text_weight": TEXT_WEIGHT,
+        "image_weight": IMAGE_WEIGHT,
+        "error": "",
+    }
+
+
+def run_batch_prediction(
+    image_input: str,
+    output_csv: str,
+    tokenizer,
+    text_model,
+    image_processor,
+    image_model,
+):
+    image_paths = find_image_paths(
+        image_input
+    )
+
+    if not image_paths:
+        raise RuntimeError(
+            f"이미지 파일이 없습니다: {image_input}"
+        )
+
+    print(
+        f"Fusion: Text {TEXT_WEIGHT:.2f} / "
+        f"Image {IMAGE_WEIGHT:.2f}"
+    )
+    print(f"이미지 개수: {len(image_paths)}")
+
+    rows = []
+
+    for index, image_path in enumerate(
+        image_paths,
+        start=1,
+    ):
+        try:
+            result = predict_single_image_result(
+                image_path=image_path,
+                tokenizer=tokenizer,
+                text_model=text_model,
+                image_processor=image_processor,
+                image_model=image_model,
+            )
+
+            rows.append(result)
+
+            print(
+                f"[{index}/{len(image_paths)}] "
+                f"{result['filename']} -> "
+                f"{result['final_label']} "
+                f"({result['final_confidence']:.4f}) "
+                f"| text={result['text_label']} "
+                f"| image={result['image_label']}"
+            )
+            print(
+                f"  OCR: {shorten_text(result['ocr_text'])}"
+            )
+
+        except Exception as error:
+            row = {
+                "filename": image_path.name,
+                "image_path": str(image_path),
+                "ocr_text": "",
+                "text_label": "",
+                "text_confidence": "",
+                "image_label": "",
+                "image_confidence": "",
+                "final_label": "ERROR",
+                "final_confidence": "",
+                "text_weight": TEXT_WEIGHT,
+                "image_weight": IMAGE_WEIGHT,
+                "error": str(error),
+            }
+            rows.append(row)
+            print(
+                f"[{index}/{len(image_paths)}] "
+                f"{image_path.name} -> ERROR: {error}"
+            )
+
+    if output_csv:
+        output_path = Path(
+            output_csv
+        )
+        output_path.parent.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        fieldnames = [
+            "filename",
+            "image_path",
+            "ocr_text",
+            "text_label",
+            "text_confidence",
+            "image_label",
+            "image_confidence",
+            "final_label",
+            "final_confidence",
+            "text_weight",
+            "image_weight",
+            "error",
+        ]
+
+        with output_path.open(
+            "w",
+            newline="",
+            encoding="utf-8-sig",
+        ) as f:
+            writer = csv.DictWriter(
+                f,
+                fieldnames=fieldnames,
+                extrasaction="ignore",
+            )
+            writer.writeheader()
+            writer.writerows(rows)
+
+        print(f"CSV 저장: {output_path}")
+
+
+def build_api_result(result):
+    return {
+        "filename": result["filename"],
+        "category": result["final_label"],
+        "confidence": result["final_confidence"],
+        "text_weight": result["text_weight"],
+        "image_weight": result["image_weight"],
+    }
+
+
+def run_api_prediction(
+    image_input: str,
+    tokenizer,
+    text_model,
+    image_processor,
+    image_model,
+):
+    image_paths = find_image_paths(
+        image_input
+    )
+
+    if not image_paths:
+        raise RuntimeError(
+            f"이미지 파일이 없습니다: {image_input}"
+        )
+
+    results = []
+
+    for image_path in image_paths:
+        try:
+            result = predict_single_image_result(
+                image_path=image_path,
+                tokenizer=tokenizer,
+                text_model=text_model,
+                image_processor=image_processor,
+                image_model=image_model,
+            )
+            results.append(
+                build_api_result(result)
+            )
+
+        except Exception as error:
+            results.append(
+                {
+                    "filename": image_path.name,
+                    "category": "ERROR",
+                    "confidence": None,
+                    "text_weight": TEXT_WEIGHT,
+                    "image_weight": IMAGE_WEIGHT,
+                    "error": str(error),
+                }
+            )
+
+    if len(results) == 1:
+        return results[0]
+
+    return {
+        "results": results
+    }
+
+
 # ==========================================
 # 이미지 한 장 전체 예측
 # ==========================================
@@ -1021,7 +1302,72 @@ def run_single_test(
 # 실행
 # ==========================================
 
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description=(
+            "CaptureMate multimodal screenshot classifier"
+        )
+    )
+    parser.add_argument(
+        "--image",
+        help="추론할 이미지 파일 경로",
+    )
+    parser.add_argument(
+        "--image-dir",
+        help="추론할 이미지들이 들어있는 폴더 경로",
+    )
+    parser.add_argument(
+        "--output-csv",
+        default="./outputs/predictions.csv",
+        help="--image 또는 --image-dir 결과를 저장할 CSV 경로",
+    )
+    parser.add_argument(
+        "--no-csv",
+        action="store_true",
+        help="CSV 저장 없이 터미널에만 출력",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="API에서 파싱하기 좋은 최종 분류 JSON만 stdout으로 출력",
+    )
+
+    return parser.parse_args()
+
+
 def main():
+    args = parse_args()
+    image_input = args.image or args.image_dir
+
+    if args.json and not image_input:
+        raise ValueError(
+            "--json은 --image 또는 --image-dir와 함께 사용해야 합니다."
+        )
+
+    if args.json:
+        with contextlib.redirect_stdout(sys.stderr):
+            tokenizer, text_model = (
+                load_text_model()
+            )
+            image_processor, image_model = (
+                load_image_model()
+            )
+            output = run_api_prediction(
+                image_input=image_input,
+                tokenizer=tokenizer,
+                text_model=text_model,
+                image_processor=image_processor,
+                image_model=image_model,
+            )
+
+        print(
+            json.dumps(
+                output,
+                ensure_ascii=False,
+            )
+        )
+        return
+
     print(f"사용 장치: {DEVICE}")
 
     print("텍스트 모델 로드 중...")
@@ -1033,6 +1379,21 @@ def main():
     image_processor, image_model = (
         load_image_model()
     )
+
+    if image_input:
+        run_batch_prediction(
+            image_input=image_input,
+            output_csv=(
+                ""
+                if args.no_csv
+                else args.output_csv
+            ),
+            tokenizer=tokenizer,
+            text_model=text_model,
+            image_processor=image_processor,
+            image_model=image_model,
+        )
+        return
 
     while True:
         print("\n" + "=" * 50)

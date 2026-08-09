@@ -24,8 +24,8 @@ CaptureMate AI는 캡쳐 이미지에서 OCR 텍스트를 추출하고, OCR 텍�
 현재 멀티모달 결합 비율은 다음과 같습니다.
 
 ```txt
-Text  = 0.7
-Image = 0.3
+Text  = 0.75
+Image = 0.25
 ```
 
 ## Setup
@@ -38,6 +38,31 @@ pip install -r requirements.txt
 
 ```bash
 python predict_multimodal.py
+```
+
+사진 파일 또는 폴더를 바로 넣어 추론 결과만 보고 싶을 때는 아래처럼 실행합니다.
+
+```bash
+python predict_multimodal.py --image ./new_images/IMG_0001.jpeg
+python predict_multimodal.py --image-dir ./new_images
+```
+
+기본 결과 CSV는 `./outputs/predictions.csv`에 저장됩니다. 터미널 출력만 보고 싶으면 `--no-csv`를 붙입니다.
+
+```bash
+python predict_multimodal.py --image-dir ./new_images --no-csv
+```
+
+API에서 바로 파싱할 최종 분류 결과만 필요하면 `--json`을 붙입니다.
+
+```bash
+python predict_multimodal.py --image ./new_images/IMG_0001.jpeg --json
+```
+
+응답 예시:
+
+```json
+{"filename":"IMG_0001.jpeg","category":"shopping","confidence":0.9231,"text_weight":0.75,"image_weight":0.25}
 ```
 
 실행하면 다음 메뉴가 표시됩니다.
